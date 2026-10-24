@@ -8,7 +8,9 @@
     "dev": "npx tauri dev",
     "tauri": "tauri",
     "serve:public": "serve public -l 3000 -s",
-    "build:css": "tailwindcss -c tailwind.config.cjs -i scripts/tailwind/base.css -o public/css/tailwind-base.css --minify && tailwindcss -c tailwind.config.cjs -i scripts/tailwind/utilities.css -o public/css/tailwind-utilities.css --minify"
+    "build:css": "tailwindcss -c tailwind.config.cjs -i scripts/tailwind/base.css -o public/css/tailwind-base.css --minify && tailwindcss -c tailwind.config.cjs -i scripts/tailwind/utilities.css -o public/css/tailwind-utilities.css --minify",
+    "build": "node --check server.mjs && npm run build:css",
+    "ci": "npm run build"
   },
   "dependencies": {
     "axios": "^1.9.0",
