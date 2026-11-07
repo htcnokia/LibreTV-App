@@ -68,7 +68,17 @@ jobs:
           npx tauri icon src-tauri/icons/icon.png
 
       - name: Build universal APK
-        run: npx tauri android build --apk --target aarch64 armv7 x86_64 --ci
+        run: |
+          set -o pipefail
+          npx tauri android build --apk --target aarch64 armv7 x86_64 --ci 2>&1 | tee android-build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: android-build.log
+          if-no-files-found: ignore
 
       - name: Sign APK
         env:
