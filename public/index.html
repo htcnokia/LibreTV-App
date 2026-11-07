@@ -200,8 +200,9 @@
                     </div>
 
                     <div class="settings-card">
-                        <div class="settings-card-title">功能开关</div>
-                        <div class="setting-row">
+                        <div class="settings-card-title" id="featureTogglesTitle">功能开关</div>
+                        <!-- 黄色内容过滤行默认隐藏：双击「功能开关」标题并输入密码后显示（见 api_management.js） -->
+                        <div class="setting-row" id="yellowFilterRow" style="display:none">
                             <div class="setting-text">
                                 <label for="yellowFilterToggle">黄色内容过滤</label>
                                 <p class="filter-description">过滤"伦理片"等黄色内容</p>

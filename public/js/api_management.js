@@ -97,6 +97,78 @@ function addAdultAPI() {
     }
 }
 
+// ---- 黄色内容过滤设置项：默认隐藏，双击「功能开关」标题并输入密码后显示 ----
+// 过滤功能本身始终生效（默认开启），隐藏的只是设置入口；
+// 解锁状态持久化（localStorage），输入一次后一直可见。
+(function initYellowFilterSecret() {
+    const UNLOCK_KEY = 'yellowFilterRowUnlocked';
+    const PASSWORD = 'Sexy';
+
+    function revealRow() {
+        const row = document.getElementById('yellowFilterRow');
+        if (row) row.style.display = '';
+    }
+
+    function showSecretModal() {
+        if (document.getElementById('yellowFilterSecretModal')) return;
+        const overlay = document.createElement('div');
+        overlay.id = 'yellowFilterSecretModal';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
+        overlay.innerHTML = `
+            <div style="background:#1e1e1e;color:#eee;border-radius:12px;padding:18px;width:min(340px,86vw);">
+                <div style="font-size:14px;font-weight:bold;margin-bottom:10px;">访问验证</div>
+                <input type="password" id="yellowFilterSecretInput" placeholder="请输入访问密码" autocomplete="off"
+                    style="width:100%;box-sizing:border-box;padding:10px;background:#111;border:1px solid #3a3a3a;border-radius:8px;color:#eee;font-size:14px;outline:none;">
+                <div style="display:flex;gap:8px;margin-top:12px;">
+                    <button type="button" id="yellowFilterSecretOk" style="flex:1;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;">确认</button>
+                    <button type="button" id="yellowFilterSecretCancel" style="flex:1;padding:10px;background:#2a2a30;color:#ddd;border:none;border-radius:8px;font-size:14px;cursor:pointer;">取消</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        const input = overlay.querySelector('#yellowFilterSecretInput');
+        input.focus();
+        const close = () => overlay.remove();
+        const tryConfirm = () => {
+            if (input.value === PASSWORD) {
+                localStorage.setItem(UNLOCK_KEY, '1');
+                revealRow();
+                if (typeof showToast === 'function') showToast('已显示黄色内容过滤设置', 'success');
+                close();
+            } else {
+                input.value = '';
+                input.placeholder = '密码错误，请重试';
+                if (typeof showToast === 'function') showToast('密码错误', 'error');
+            }
+        };
+        overlay.querySelector('#yellowFilterSecretOk').addEventListener('click', tryConfirm);
+        overlay.querySelector('#yellowFilterSecretCancel').addEventListener('click', close);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryConfirm(); });
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    }
+
+    // 双击检测：click 事件手动计时（400ms 内两次），移动端双击缩放不干扰
+    function bindSecretTrigger(el) {
+        if (!el) return;
+        let lastTap = 0;
+        el.addEventListener('click', () => {
+            const now = Date.now();
+            if (now - lastTap < 400) {
+                lastTap = 0;
+                if (localStorage.getItem(UNLOCK_KEY) === '1') {
+                    if (typeof showToast === 'function') showToast('设置项已显示', 'info');
+                    return;
+                }
+                showSecretModal();
+            } else {
+                lastTap = now;
+            }
+        });
+    }
+
+    bindSecretTrigger(document.getElementById('featureTogglesTitle'));
+    if (localStorage.getItem(UNLOCK_KEY) === '1') revealRow();
+})();
+
 // 检查是否有成人API被选中
 function checkAdultAPIsSelected() {
     const adultBuiltinCheckboxes = document.querySelectorAll('#apiCheckboxes .api-adult:checked');
