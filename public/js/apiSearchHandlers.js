@@ -117,7 +117,7 @@ function searchRelevanceScore(query, title) {
 // 受「黄色内容过滤」开关（yellowFilterEnabled，默认开）控制——此前该开关
 // 只管成人源是否出现在管理列表，搜索结果层从来没有过滤（审计查实）。
 const ADULT_TITLE_RE = /(麻豆|福利姬|援交|AV女优|色情|淫|奸|嫖|娼|性爱|做爱|肉体交易|偷情视频|无码|有码|巨乳|人妻出轨|制服诱惑|羞羞漫画|蜜桃影像)/;
-const ADULT_CLASS_RE = /(伦理|情色|写真|福利|有色)/;
+const ADULT_CLASS_RE = /(伦理|理论|情色|写真|福利|有色|里番)/;
 
 function isAdultSearchResult(item) {
     const cls = String(item.vod_class || item.type_name || '');

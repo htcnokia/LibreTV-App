@@ -1,6 +1,6 @@
 // 搜索功能：多源并发，按源分组，结果逐个源渐进渲染
 
-const YELLOW_TYPE_KEYWORDS = ['伦理片', '福利', '里番动漫', '门事件', '萝莉少女', '制服诱惑', '国产传媒', 'cosplay', '黑丝诱惑', '无码', '日本无码', '有码', '日本有码', 'SWAG', '网红主播', '色情片', '同性片', '福利视频', '福利片'];
+const YELLOW_TYPE_KEYWORDS = ['伦理片', '理论片', '福利', '里番动漫', '门事件', '萝莉少女', '制服诱惑', '国产传媒', 'cosplay', '黑丝诱惑', '无码', '日本无码', '有码', '日本有码', 'SWAG', '网红主播', '色情片', '同性片', '福利视频', '福利片', '情色', '写真', '麻豆', '偷拍', '淫', '巨乳', '人妻', '夜店', '陪聊', '裸聊', '声优福利'];
 
 const searchState = {
     token: 0,
@@ -43,6 +43,15 @@ function filterSearchItems(items) {
     return items.filter(item => !YELLOW_TYPE_KEYWORDS.some(keyword => (item.type_name || '').includes(keyword)));
 }
 
+// 相关度过滤 + 排序（丢弃单字OR匹配的垃圾与成人标题），与 api.js 聚合、
+// search_module 路径共用同一实现（apiSearchHandlers.js 先于本文件加载）。
+// 源标签页的计数与卡片都基于过滤后的结果——用户在任一标签下看到的都是
+// 干净列表，而不是「全部页干净、单源页 100 条垃圾」。
+function applyRelevanceToIngest(items, query) {
+    if (typeof applySearchRelevanceAndFilter !== 'function') return items;
+    return applySearchRelevanceAndFilter(items, query).list;
+}
+
 async function searchSingleSource(apiId, query, token) {
     const api = resolveSearchApi(apiId);
     if (!api) return;
@@ -50,7 +59,7 @@ async function searchSingleSource(apiId, query, token) {
     try {
         const first = await fetchSearchList(api.base + API_CONFIG.search.path + encodeURIComponent(query));
         if (token !== searchState.token) return;
-        appendSearchResults(apiId, api.name, filterSearchItems(first.list.map(tag)));
+        appendSearchResults(apiId, api.name, applyRelevanceToIngest(filterSearchItems(first.list.map(tag)), query));
 
         const extraPages = Math.min(first.pagecount, API_CONFIG.search.maxPages) - 1;
         if (extraPages > 0) {
@@ -61,7 +70,7 @@ async function searchSingleSource(apiId, query, token) {
                 return fetchSearchList(url).catch(() => ({ list: [] }));
             }));
             if (token !== searchState.token) return;
-            appendSearchResults(apiId, api.name, filterSearchItems(pages.flatMap(page => page.list.map(tag))));
+            appendSearchResults(apiId, api.name, applyRelevanceToIngest(filterSearchItems(pages.flatMap(page => page.list.map(tag))), query));
         }
     } catch (error) {
         console.warn(`API ${apiId} 搜索失败:`, error && error.message ? error.message : error);

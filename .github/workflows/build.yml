@@ -126,6 +126,9 @@ jobs:
           "${BUILD_TOOLS}/apksigner" sign --ks release.jks --ks-pass "pass:${STORE_PASS}" \
             --key-pass "pass:${KEY_PASS}" --ks-key-alias "$KEY_ALIAS" --out "$OUT" aligned.apk
           "${BUILD_TOOLS}/apksigner" verify --print-certs "$OUT"
+          # 打印 APK 实际 versionName/versionCode——安装时显示的版本以此为准，
+          # 与 Release 标签不一致时可在本日志直接核对
+          "${BUILD_TOOLS}/aapt" dump badging "$OUT" | grep -E "^package:" || true
           rm -f release.jks aligned.apk
 
       - uses: actions/upload-artifact@v4

@@ -206,6 +206,8 @@ pub struct CastUpstreamStatus {
     pub delivered_secs: f64,
     pub media_url: String,
     pub total_segments: usize,
+    /// VOD 完整播完（JS 自动连播下一集用）
+    pub completed: bool,
 }
 
 #[tauri::command]
@@ -229,6 +231,7 @@ pub fn cast_upstream_status() -> Option<CastUpstreamStatus> {
         delivered_secs,
         media_url: st.media_url.clone(),
         total_segments: st.segments.len(),
+        completed: st.completed,
     })
 }
 
@@ -3829,6 +3832,9 @@ struct TsStreamState {
     hls_key: Option<HlsKeyInfo>,
     /// 密钥内容（16 字节，首次使用时取回并缓存）
     hls_key_bytes: Option<Vec<u8>>,
+    /// 整部内容已完整下发（VOD endlist 正常走完）——JS 轮询它做
+    /// 「投屏自动连播下一集」；与 abandoned（中途放弃）互斥
+    completed: bool,
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -4534,6 +4540,15 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     }
     // 连接结束：管道条目留在会话里（属于会话不属于连接），下一个连接直接接着读。
     // 任务取消统一收口在会话作废路径（重置/淘汰/开新投屏）。
+    // VOD 完整走完（endlist 正常 break、非放弃非断开）→ 标记 completed，
+    // JS 轮询它自动连播下一集。
+    if end_result.is_ok() && endlist {
+        if let Ok(mut map) = TS_STREAM_STATES.lock() {
+            if let Some(st) = map.get_mut(token.as_str()) {
+                st.completed = true;
+            }
+        }
+    }
     if pipeline_hits > 0 || conn_sent > 0 || end_result.is_err() {
         if let Ok(mut map) = TS_STREAM_STATES.lock() {
             if let Some(st) = map.get_mut(token.as_str()) {

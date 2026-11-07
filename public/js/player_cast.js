@@ -795,7 +795,16 @@
             if (castRecovery.tried) return;
             try {
                 const st = await tauriInvoke('cast_upstream_status');
-                if (!st || !st.abandoned) return;
+                if (!st) return;
+                // VOD 完整播完 → 自动连播下一集（与 App 内播放的「自动连播」
+                // 开关共用 autoplayEnabled；未开启或已是最后一集则不动）
+                if (st.completed) {
+                    castRecovery.tried = true;
+                    stopCastRecoveryPolling();
+                    await castNextEpisodeOnComplete();
+                    return;
+                }
+                if (!st.abandoned) return;
                 castRecovery.tried = true;
                 stopCastRecoveryPolling();
                 saveCastPositionFromStatus(); // 中断位置先落盘
@@ -808,6 +817,30 @@
         if (castRecovery.timer) {
             clearInterval(castRecovery.timer);
             castRecovery.timer = null;
+        }
+    }
+
+    // 投屏自动连播：当前集完整播完后，电视停在片尾——自动投下一集
+    // （沿用 App 内播放的「自动连播」开关；换源恢复与手动停止不触发）
+    async function castNextEpisodeOnComplete() {
+        try {
+            const autoplay = localStorage.getItem('autoplayEnabled') !== 'false';
+            if (!autoplay) return;
+            if (!Array.isArray(currentEpisodes) || currentEpisodes.length < 2) return;
+            const next = (typeof currentEpisodeIndex === 'number' ? currentEpisodeIndex : 0) + 1;
+            if (next >= currentEpisodes.length) return; // 已是最后一集
+            if (!currentEpisodes[next]) return;
+            if (!dlnaActiveControlUrl) return;
+            currentEpisodeIndex = next;
+            const url = currentEpisodes[next];
+            currentVideoUrl = url;
+            try { localStorage.setItem('currentEpisodeIndex', String(next)); } catch (e) { /* 忽略 */ }
+            notice(activeArt, '本集播完，自动连播下一集…');
+            // 剧集切了，上一集的投屏位置不再适用（不同 URL 不同键，天然隔离）
+            const device = { name: castRecovery.lastDeviceName || '电视', control_url: dlnaActiveControlUrl, protocol: 'dlna' };
+            castUrlToDevice(device, url, typeof currentReferer === 'function' ? currentReferer() : null, false, 0);
+        } catch (e) {
+            console.warn('cast auto-next failed', e);
         }
     }
 
