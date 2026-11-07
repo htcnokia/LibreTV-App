@@ -266,20 +266,31 @@ class MusicPlaybackService : Service() {
             this, 2, makeIntent(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION") Notification.Builder(this)
-        }
-        builder
+        // 用 androidx.core 的 Builder：MediaStyle 属于 androidx 通知体系，
+        // 框架 Notification.Builder 收不了它（CI 编译错误实证：
+        // "inferred type is NotificationCompat.MediaStyle! but Notification.Style! was expected"）
+        val builder = androidx.core.app.NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(currentTitle)
             .setContentText(currentArtist)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(contentIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(0, if (playing) "暂停" else "继续", toggleIntent)
-            .addAction(0, "停止", stopIntent)
+            .setVisibility(androidx.core.app.NotificationCompat.VISIBILITY_PUBLIC)
+        val pauseIcon = androidx.core.graphics.drawable.IconCompat.createWithResource(
+            this, if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        )
+        builder.addAction(
+            androidx.core.app.NotificationCompat.Action.Builder(
+                pauseIcon, if (playing) "暂停" else "继续", toggleIntent
+            ).build()
+        )
+        builder.addAction(
+            androidx.core.app.NotificationCompat.Action.Builder(
+                androidx.core.graphics.drawable.IconCompat.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                "停止", stopIntent
+            ).build()
+        )
         // MediaStyle：系统媒体控制卡片（锁屏/下拉），需要 mediaSession token
         mediaSession?.let { session ->
             builder.setStyle(
