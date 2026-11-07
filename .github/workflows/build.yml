@@ -80,6 +80,16 @@ jobs:
           path: android-build.log
           if-no-files-found: ignore
 
+      - name: Summarize build errors
+        if: failure()
+        run: |
+          grep -inE "^e: |error:|FAILURE|Caused by:|Exception|what went wrong" android-build.log | head -25 | while IFS= read -r line; do
+            echo "::error::${line:0:500}"
+          done
+          tail -n 40 android-build.log | while IFS= read -r line; do
+            echo "::error::${line:0:500}"
+          done
+
       - name: Sign APK
         env:
           ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
