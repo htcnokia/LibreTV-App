@@ -26,6 +26,8 @@ async function musicSearchStart(query) {
     musicSearchState.token += 1;
     const token = musicSearchState.token;
     musicSearchState.query = q;
+    // 记住最后一次搜索词：切回音乐页时恢复搜索与标签高亮
+    try { localStorage.setItem('musicLastQuery', q); } catch (e) { /* 存不下就算了 */ }
     musicSearchState.page = 1;
     musicSearchState.results = [];
     musicSearchState.searching = true;

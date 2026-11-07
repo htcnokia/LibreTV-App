@@ -425,15 +425,24 @@
                     if (Array.isArray(list)) adUris = list;
                 }
             } catch (e) { adUris = []; }
+            // 投屏位置记忆：换源恢复用 Rust 报告的秒数（positionOverride）；
+            // 普通投屏取「上次投屏位置 vs App 播放器位置」的较大者——
+            // 投屏期间 App 播放器是暂停的，currentTime 是陈旧值
+            let castPosition = (typeof positionOverride === 'number' && positionOverride > 0)
+                ? positionOverride : 0;
+            if (!castPosition) {
+                const savedCast = Number(localStorage.getItem('castPos:' + url) || 0) || 0;
+                const inAppPos = Math.floor((art.video && art.video.currentTime) || 0);
+                castPosition = Math.max(savedCast, inAppPos);
+                if (savedCast > 60 && savedCast > inAppPos) {
+                    notice(art, '将从上次投屏位置（' + formatTime(savedCast) + '）继续');
+                }
+            }
             tauriInvoke('cast_to_device', {
                 controlUrl: device.control_url,
                 url: url,
                 title: (typeof currentVideoTitle === 'string' && currentVideoTitle) ? currentVideoTitle : 'LibreTV',
-                // 换源恢复时用 Rust 报告的「已实际下发秒数」定位（App 播放器的
-                // currentTime 与投屏进度可能不同步）
-                position: (typeof positionOverride === 'number' && positionOverride > 0)
-                    ? positionOverride
-                    : ((art.video && art.video.currentTime) || 0),
+                position: castPosition,
                 referer: referer || null,
                 adUris: adUris
             }).then(onOk).catch(onErr);
@@ -745,8 +754,25 @@
         } catch (e) { /* 忽略：提示失败不影响投屏本身 */ }
     }
 
+    // 投屏位置持久化：停止/中断时把「已实际下发的秒数」按剧集 URL 存起来——
+    // 下次对同一集投屏自动从该位置继续（TS 串流的续播由代理侧起始分片跳过实现）
+    function saveCastPositionFromStatus() {
+        try {
+            if (!isTauri() || typeof tauriInvoke !== 'function') return;
+            tauriInvoke('cast_upstream_status').then(st => {
+                if (!st || !(st.delivered_secs > 10) || !st.media_url) return;
+                const key = 'castPos:' + st.media_url;
+                const prev = Number(localStorage.getItem(key) || 0) || 0;
+                if (st.delivered_secs > prev) {
+                    localStorage.setItem(key, String(Math.floor(st.delivered_secs)));
+                }
+            }).catch(() => { /* 状态读取失败不影响停止 */ });
+        } catch (e) { /* 忽略 */ }
+    }
+
     function stopDlna(deviceControlUrl) {
         if (!isTauri() || typeof tauriInvoke !== 'function') return;
+        saveCastPositionFromStatus(); // 先取位置再停（停止后状态仍在，但早取更稳）
         setCastKeepAwake(false);
         stopCastRecoveryPolling();
         tauriInvoke('stop_dlna_cast', { controlUrl: deviceControlUrl }).catch(() => { /* ignore */ });
@@ -772,6 +798,7 @@
                 if (!st || !st.abandoned) return;
                 castRecovery.tried = true;
                 stopCastRecoveryPolling();
+                saveCastPositionFromStatus(); // 中断位置先落盘
                 await recoverCastViaRelink(st);
             } catch (e) { /* 状态查询失败不影响投屏 */ }
         }, 3000);

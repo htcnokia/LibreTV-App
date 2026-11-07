@@ -13,7 +13,11 @@ import android.media.MediaPlayer
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
+import androidx.media.app.NotificationCompat as MediaNotificationCompat
 
 /**
  * 音乐后台播放前台服务。
@@ -35,6 +39,9 @@ class MusicPlaybackService : Service() {
     private var currentArtist = ""
     private var pendingSeekMs = 0
     private var shouldPlayWhenReady = true
+    // MediaSession：系统媒体控制卡片（锁屏/下拉快捷区）的接入点——
+    // 没有它，Android 13+ 的媒体通知不会出现在「媒体播放器」区域
+    private var mediaSession: MediaSessionCompat? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -93,6 +100,7 @@ class MusicPlaybackService : Service() {
                 if (pendingSeekMs > 0) mp.seekTo(pendingSeekMs)
                 pendingSeekMs = 0
                 if (shouldPlayWhenReady) mp.start()
+                updatePlaybackState(true)
                 updateNotification()
                 emit("playing")
             }
@@ -122,6 +130,7 @@ class MusicPlaybackService : Service() {
         val p = player ?: return
         try {
             if (!p.isPlaying) p.start()
+            updatePlaybackState(true)
             updateNotification()
             emit("playing")
         } catch (e: Exception) { /* 已释放等场景忽略 */ }
@@ -132,6 +141,7 @@ class MusicPlaybackService : Service() {
         try { player?.takeIf { it.isPlaying }?.pause() } catch (e: Exception) { /* 忽略 */ }
         abandonAudioFocus()
         releaseWakeLock()
+        updatePlaybackState(false)
         emit("paused")
     }
 
@@ -261,7 +271,7 @@ class MusicPlaybackService : Service() {
         } else {
             @Suppress("DEPRECATION") Notification.Builder(this)
         }
-        return builder
+        builder
             .setContentTitle(currentTitle)
             .setContentText(currentArtist)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -270,7 +280,15 @@ class MusicPlaybackService : Service() {
             .setOnlyAlertOnce(true)
             .addAction(0, if (playing) "暂停" else "继续", toggleIntent)
             .addAction(0, "停止", stopIntent)
-            .build()
+        // MediaStyle：系统媒体控制卡片（锁屏/下拉），需要 mediaSession token
+        mediaSession?.let { session ->
+            builder.setStyle(
+                MediaNotificationCompat.MediaStyle()
+                    .setMediaSession(session.sessionToken)
+                    .setShowActionsInCompactView(0, 1)
+            )
+        }
+        return builder.build()
     }
 
     private fun createNotificationChannel() {
@@ -285,6 +303,31 @@ class MusicPlaybackService : Service() {
                 )
             }
         }
+    }
+
+    private fun updatePlaybackState(playing: Boolean) {
+        val session = mediaSession ?: return
+        try {
+            val pos = try { player?.currentPosition?.toLong() ?: 0L } catch (e: Exception) { 0L }
+            session.setPlaybackState(
+                PlaybackStateCompat.Builder()
+                    .setActions(PlaybackStateCompat.ACTION_PLAY
+                        or PlaybackStateCompat.ACTION_PAUSE
+                        or PlaybackStateCompat.ACTION_STOP
+                        or PlaybackStateCompat.ACTION_SEEK_TO)
+                    .setState(
+                        if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
+                        pos, if (playing) 1f else 0f
+                    )
+                    .build()
+            )
+            session.setMetadata(
+                MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentTitle)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentArtist)
+                    .build()
+            )
+        } catch (e: Exception) { /* 忽略 */ }
     }
 
     // ---- JS 事件回推 ----
@@ -330,12 +373,25 @@ class MusicPlaybackService : Service() {
         super.onCreate()
         instance = this
         createNotificationChannel()
+        mediaSession = MediaSessionCompat(this, "LibreTVMusic").apply {
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() { onStartCommand(makeIntent(ACTION_RESUME), 0, 0) }
+                override fun onPause() { onStartCommand(makeIntent(ACTION_PAUSE), 0, 0) }
+                override fun onStop() { onStartCommand(makeIntent(ACTION_STOP), 0, 0) }
+                override fun onSeekTo(pos: Long) {
+                    onStartCommand(makeIntent(ACTION_SEEK).putExtra(EXTRA_POSITION, pos / 1000f), 0, 0)
+                }
+            })
+            isActive = true
+        }
     }
 
     override fun onDestroy() {
         releasePlayer()
         abandonAudioFocus()
         releaseWakeLock()
+        try { mediaSession?.release() } catch (e: Exception) { /* 已释放 */ }
+        mediaSession = null
         if (instance === this) instance = null
         super.onDestroy()
     }

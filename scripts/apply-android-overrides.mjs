@@ -100,5 +100,22 @@ if (!manifest.includes('MusicPlaybackService')) {
     process.exit(1);
   }
 }
+
+// 音乐服务用 MediaSessionCompat + MediaStyle 通知（系统媒体控制卡片），
+// 需要 androidx.media 依赖——Tauri 模板不含它，这里补进 app 的依赖块。
+const gradlePath = join(target, 'app', 'build.gradle.kts');
+if (existsSync(gradlePath)) {
+  let gradle = readFileSync(gradlePath, 'utf8');
+  if (!gradle.includes('androidx.media:media')) {
+    const before = gradle;
+    gradle = gradle.replace(/(dependencies\s*\{)/, '$1\n    implementation("androidx.media:media:1.7.0")');
+    if (gradle === before) {
+      console.error('[android-overrides] 无法定位 dependencies 块，androidx.media 依赖未注入。');
+    } else {
+      writeFileSync(gradlePath, gradle);
+      console.log('[android-overrides] androidx.media 依赖已注入');
+    }
+  }
+}
 writeFileSync(manifestPath, manifest);
 console.log('[android-overrides] patched AndroidManifest.xml');

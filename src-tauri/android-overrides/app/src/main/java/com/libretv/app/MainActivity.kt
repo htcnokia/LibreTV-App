@@ -417,6 +417,9 @@ class MainActivity : TauriActivity() {
     @JavascriptInterface
     fun musicPlay(url: String, title: String, artist: String, position: Double) {
       try {
+        // Android 13+ 通知需要运行时权限：没有它，最小化后播放控制条（通知）
+        // 不会显示——投屏路径的 keepAwake 已请求过，音乐路径此前漏掉
+        requestNotificationPermission()
         val intent = Intent(this@MainActivity, MusicPlaybackService::class.java)
           .setAction(MusicPlaybackService.ACTION_PLAY)
           .putExtra(MusicPlaybackService.EXTRA_URL, url)

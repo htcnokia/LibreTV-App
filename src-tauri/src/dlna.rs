@@ -216,7 +216,13 @@ pub fn cast_upstream_status() -> Option<CastUpstreamStatus> {
     }
     let map = TS_STREAM_STATES.lock().ok()?;
     let st = map.get(&token)?;
-    let delivered_secs: f64 = st.durations.iter().take(st.served.len()).sum();
+    // 位置 = 起始分片偏移 + 本次会话实际下发的分片时长
+    let delivered_secs: f64 = st
+        .durations
+        .iter()
+        .skip(st.start_index)
+        .take(st.served.len())
+        .sum();
     Some(CastUpstreamStatus {
         abandoned: st.abandoned.is_some(),
         reason: st.abandoned.clone().unwrap_or_default(),
@@ -391,6 +397,23 @@ pub async fn cast_to_device(
                             ts_abort_pipeline(st);
                         }
                     }
+                    // 投屏续播：预建会话写入起始位置——serve_live_ts 首连时
+                    // 按它跳过起始分片（TS 串流形态电视端 Seek 不可用）。
+                    // 手机播放中暂停后直接点投屏，也会带着 in-app 进度进来。
+                    if let Some(pos) = position {
+                        if pos > 1.0 {
+                            if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                                map.insert(
+                                    ts_token.clone(),
+                                    TsStreamState {
+                                        start_position: pos,
+                                        started_at: Some(Instant::now()),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                    }
                     let (_, ts_entry) = start_stream_proxy(
                         url.clone(),
                         ts_token.clone(),
@@ -454,6 +477,15 @@ pub async fn cast_to_device(
                     // 拒收 → 记入 attempts 并自动落到下一个投屏梯度；
                     // 缓冲中 → 不算失败（慢源/慢电视，用户侧表现是稍等起播）。
                     let verdict = verify_playback_started(&control_url).await;
+                    // 起播确认后补一次 Seek：部分电视在缓冲未完成时忽略
+                    // 早发的 REL_TIME Seek（幂等——早 Seek 生效的电视重复
+                    // seek 到同一位置无害）
+                    if let Some(pos) = position {
+                        if pos > 1.0 && *mode != "proxy-ts"
+                            && matches!(verdict, PlayVerdict::Playing) {
+                            let _ = dlna_seek(&control_url, pos).await;
+                        }
+                    }
                     let addr_desc = parse_http_url(&playback_url)
                         .map(|(h, p, _)| format!("{}:{}", h, p))
                         .unwrap_or_else(|| "—".to_string());
@@ -3623,9 +3655,15 @@ struct TsStreamState {
     /// 整条流被判故障放弃的原因（供 JS 轮询做自动换源恢复）。
     abandoned: Option<String>,
     /// 分片时长表（EXTINF 秒），与 segments 一一对应。
-    /// delivered_secs = durations[..served.len()] 之和 —— 换源恢复时用来
-    /// 在新源的清单里定位到相同的播放位置。
+    /// delivered_secs = durations[start_index..start_index+served.len()] 之和 ——
+    /// 换源恢复时用来在新源的清单里定位到相同的播放位置。
     durations: Vec<f64>,
+    /// 投屏续播：起始时间（秒）。cast_to_device 预建会话时写入，
+    /// serve_live_ts 首连时按它跳过对应分片（TS 串流的 REL_TIME Seek
+    /// 不可用——电视看到的是无总长的直播形态流，只能在代理侧跳）。
+    start_position: f64,
+    /// 起始分片下标（start_position 换算而来），位置换算的偏移基准
+    start_index: usize,
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3790,6 +3828,40 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             return Ok(());
         }
     };
+
+    // ---- 投屏续播：按起始时间跳过对应分片 ----
+    // TS 串流在电视端是「无总长的直播形态流」，REL_TIME Seek 不可用——
+    // 续播只能在代理侧做：按 EXTINF 累计时长找到起始分片下标，
+    // 从那一片开始下发（分片粒度 ≈ ±5s，电视端表现为从相近位置继续）。
+    // 仅首连且无任何已下发进度时应用（重连续传有自己的字节级定位）。
+    let mut start_index = 0usize;
+    let start_position = TS_STREAM_STATES
+        .lock()
+        .ok()
+        .and_then(|m| {
+            m.get(&token)
+                // 仅首连（无任何下发进度）应用——重连续传有自己的字节级定位，
+                // 二次跳过会让位置直接跳走
+                .filter(|st| st.served.is_empty() && st.total_bytes == 0)
+                .map(|st| st.start_position)
+        })
+        .unwrap_or(0.0);
+    if start_position > 1.0 && durations.len() >= pending.len() && !pending.is_empty() {
+        let mut acc = 0f64;
+        for (i, d) in durations.iter().enumerate() {
+            if acc >= start_position as f64 {
+                start_index = i;
+                break;
+            }
+            acc += *d;
+            start_index = i + 1;
+        }
+        if start_index >= pending.len() {
+            start_index = 0; // 超出总时长（异常）：从头
+        } else if start_index > 0 {
+            pending.drain(..start_index);
+        }
+    }
 
     let ts_mime = if upstream.is_samsung {
         "video/vnd.dlna.mpeg-tts"
@@ -3974,6 +4046,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             st.last_conn_at = Some(now);
             st.last_conn_total = st.total_bytes;
             st.durations = durations;
+            // 起始分片下标：只在还没有任何进度时登记（重连不重置）
+            if st.served.is_empty() && st.total_bytes == 0 {
+                st.start_index = start_index;
+            }
         }
     }
     // 预取管线：上游并行挂 TS_PREFETCH_DEPTH 个分片请求，写出严格按清单顺序。

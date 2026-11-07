@@ -4,6 +4,14 @@
 
 const musicUIState = { view: 'search', searchTokenSeen: -1 };
 
+// 搜索回调接线（此前从未实现——musicSearchStart 异步填充结果后无人重渲染，
+// 表现为「点标签/搜索后要再点一次才出结果」：第二次渲染的是第一次的结果）
+window.musicSearchUI = {
+    onStart: () => musicUIRenderSearch(),
+    onPartial: () => musicUIRenderSearch(), // 每个源返回后增量渲染（先到先显示）
+    onDone: () => musicUIRenderSearch()
+};
+
 const musicPlayerUI = {
     onLoading(item) { musicUIRenderPlayerBar(); musicUIRenderQueue(); },
     onTrackChange(item, index) { musicUIRenderPlayerBar(); musicUIRenderQueue(); },
@@ -241,6 +249,16 @@ function musicUIBind() {
         // 手动改词即熄灭标签（新搜索还没发起，旧高亮已不成立）
         searchInput.addEventListener('input', () => musicUISyncHotTagActive(searchInput.value));
     }
+
+    // 恢复上次搜索：填词 + 点亮标签 + 自动重搜（结果回来由 musicSearchUI 渲染）
+    try {
+        const lastQuery = localStorage.getItem('musicLastQuery') || '';
+        if (lastQuery && searchInput) {
+            searchInput.value = lastQuery;
+            musicUISyncHotTagActive(lastQuery);
+            musicSearchStart(lastQuery);
+        }
+    } catch (e) { /* 恢复失败不影响页面 */ }
     // 热门标签
     const hotRow = document.getElementById('musicHotTags');
     // 点亮与当前搜索词一致的标签：点击标签=自动搜索+点亮；手动搜索命中
