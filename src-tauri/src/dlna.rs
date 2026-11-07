@@ -779,14 +779,15 @@ pub async fn dlna_diagnostics(
                                         "    - 分片清单读取: 失败 —— {}\n",
                                         e
                                     )),
-                                    Ok(Ok((segments, _durations, endlist))) => {
+                                    Ok(Ok(pl)) => {
+                                        let segments = &pl.segments;
                                         if segments.is_empty() {
                                             report.push_str("    - 分片清单为空（无可用分片）\n");
                                         } else {
                                             report.push_str(&format!(
                                                 "    - 媒体清单 OK: {} 个分片（{}）\n",
                                                 segments.len(),
-                                                if endlist { "VOD" } else { "直播流" }
+                                                if pl.endlist { "VOD" } else { "直播流" }
                                             ));
                                             // 首个分片 Range 试探（64KB）：只测可达性与速度，
                                             // 不整片下载（整片在慢网络下会拖住诊断）
@@ -3053,15 +3054,38 @@ async fn resolve_media_playlist(url: &str, upstream: &Upstream) -> Result<String
 /// 加密（AES-128/SAMPLE-AES）与 fMP4（EXT-X-MAP）无法靠拼接转 TS，直接报错
 /// 让投屏梯度落到下一个模式。
 /// ad_uris：前端判定好的广告分片 URI（已解析成绝对地址），命中的分片整块跳过。
+/// HLS AES-128 密钥信息（METHOD=AES-128 的 EXT-X-KEY 行）。
+/// 密钥按清单公开下发（URI 指向 16 字节密钥文件），解密是标准 HLS 能力。
+#[derive(Clone, Debug)]
+struct HlsKeyInfo {
+    /// 密钥文件地址（已解析为绝对地址）
+    uri: String,
+    /// 显式 IV（IV=0x... 属性）；None = 隐式 IV（分片的媒体序号，64 位大端）
+    iv: Option<[u8; 16]>,
+    /// MEDIA-SEQUENCE（隐式 IV 计算用）
+    media_sequence: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MediaPlaylist {
+    segments: Vec<String>,
+    durations: Vec<f64>,
+    endlist: bool,
+    /// AES-128 密钥信息（METHOD=NONE 或无 KEY 行时为 None）
+    key: Option<HlsKeyInfo>,
+}
+
 fn parse_media_playlist(
     text: &str,
     base_url: &str,
     ad_uris: &[String],
-) -> Result<(Vec<String>, Vec<f64>, bool), String> {
+) -> Result<MediaPlaylist, String> {
     let mut segments = Vec::new();
     let mut durations: Vec<f64> = Vec::new();
     let mut pending_duration = 0f64;
     let mut endlist = false;
+    let mut key: Option<HlsKeyInfo> = None;
+    let mut media_sequence = 0u64;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -3077,12 +3101,48 @@ fn parse_media_playlist(
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
+            // AES-128 是 HLS 标准加密（密钥按清单公开下发）——提取密钥信息，
+            // 取流时解密（v1.5.20 之前直接拒绝，加密源完全无法投屏）
             let method = rest
                 .split(',')
                 .find_map(|kv| kv.strip_prefix("METHOD="))
-                .unwrap_or("NONE");
-            if !method.eq_ignore_ascii_case("NONE") {
-                return Err(format!("源分片已加密（{}），TS 串流暂不支持", method));
+                .unwrap_or("NONE")
+                .trim()
+                .to_string();
+            if method.eq_ignore_ascii_case("NONE") {
+                continue; // 明文段
+            }
+            if !method.eq_ignore_ascii_case("AES-128") {
+                return Err(format!("源分片加密方式为 {}（仅支持 AES-128）", method));
+            }
+            let key_uri = rest
+                .split(',')
+                .find_map(|kv| kv.strip_prefix("URI="))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .map(|u| resolve_url(base_url, &u));
+            let iv = rest
+                .split(',')
+                .find_map(|kv| kv.strip_prefix("IV="))
+                .and_then(|v| {
+                    let hex = v.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    if hex.len() != 32 {
+                        return None;
+                    }
+                    let mut iv = [0u8; 16];
+                    for i in 0..16 {
+                        iv[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+                    }
+                    Some(iv)
+                });
+            if let Some(uri) = key_uri {
+                key = Some(HlsKeyInfo { uri, iv, media_sequence: 0 });
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = rest.trim().parse::<u64>().unwrap_or(0);
+            if let Some(k) = key.as_mut() {
+                k.media_sequence = media_sequence;
             }
             continue;
         }
@@ -3107,14 +3167,18 @@ fn parse_media_playlist(
         durations.push(pending_duration);
         pending_duration = 0.0;
     }
-    Ok((segments, durations, endlist))
+    // MEDIA-SEQUENCE 在 KEY 行之后出现的补记
+    if let Some(k) = key.as_mut() {
+        k.media_sequence = media_sequence;
+    }
+    Ok(MediaPlaylist { segments, durations, endlist, key })
 }
 
 /// 拉取并解析媒体清单。
 async fn fetch_media_playlist(
     url: &str,
     upstream: &Upstream,
-) -> Result<(Vec<String>, Vec<f64>, bool), String> {
+) -> Result<MediaPlaylist, String> {
     let text = upstream_text(url, upstream).await?;
     parse_media_playlist(&text, url, &upstream.ad_uris)
 }
@@ -3159,8 +3223,9 @@ async fn refresh_expired_segment(
     seg_index: usize,
     old_url: &str,
 ) -> Option<String> {
-    let (segments, _durations, endlist) = fetch_media_playlist(media_url, upstream).await.ok()?;
-    if !endlist || seg_index >= segments.len() {
+    let pl = fetch_media_playlist(media_url, upstream).await.ok()?;
+    let segments = &pl.segments;
+    if !pl.endlist || seg_index >= segments.len() {
         return None;
     }
     let new_url = segments[seg_index].clone();
@@ -3244,14 +3309,20 @@ async fn warm_ts_stream(target: String, upstream: Arc<Upstream>) {
     }
     let prepared = async {
         let media_url = resolve_media_playlist(&target, &upstream).await?;
-        let (pending, _durations, _endlist) = fetch_media_playlist(&media_url, &upstream).await?;
-        Ok::<Vec<String>, String>(pending)
+        let pl = fetch_media_playlist(&media_url, &upstream).await?;
+        Ok::<MediaPlaylist, String>(pl)
     }
     .await;
-    let pending = match prepared {
-        Ok(list) => list,
+    let pl = match prepared {
+        Ok(pl) => pl,
         Err(_) => return,
     };
+    // 加密源跳过预热：预热缓存里存的是密文，解密发生在分片下载管线里，
+    // 预热的密文字节会被当成明文写进流（首两片花屏）
+    if pl.key.is_some() {
+        return;
+    }
+    let pending = pl.segments;
     for seg in pending.iter().take(TS_PRIME_SEGMENTS) {
         if let Ok(data) = fetch_segment_bytes(seg, &upstream).await {
             if let Ok(mut cache) = TS_PRIME.lock() {
@@ -3320,6 +3391,83 @@ fn notify_entry(e: &SegHandle) {
     notify.notify_waiters();
 }
 
+/// 隐式 IV：HLS 规范——KEY 行无 IV 属性时，用分片的媒体序号（64 位大端）。
+fn sequence_iv(seq: u64) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[8..].copy_from_slice(&seq.to_be_bytes());
+    iv
+}
+
+/// HLS AES-128 分片解密（AES-128-CBC + PKCS7 去填充，HLS 规范的标准加密方式）。
+fn aes128_cbc_decrypt_segment(cipher: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, String> {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    if key.len() != 16 {
+        return Err(format!("AES-128 密钥长度异常: {} 字节", key.len()));
+    }
+    if cipher.is_empty() || cipher.len() % 16 != 0 {
+        return Err(format!("密文长度 {} 不是 16 的倍数（分片不完整）", cipher.len()));
+    }
+    type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+    let key_arr: &[u8; 16] = key.try_into().expect("密钥长度已校验");
+    let mut dec = Aes128CbcDec::new(key_arr.into(), iv.into());
+    let mut buf = cipher.to_vec();
+    let pt = dec
+        .decrypt_padded_mut::<block_padding::Pkcs7>(&mut buf)
+        .map_err(|e| format!("分片解密失败: {}", e))?;
+    Ok(pt.to_vec())
+}
+
+/// 取 HLS AES-128 密钥内容（16 字节），按 URI 缓存在会话里（密钥文件全片共用）。
+async fn ensure_hls_key_bytes(token: &str, upstream: &Upstream) -> Option<Vec<u8>> {
+    {
+        let map = TS_STREAM_STATES.lock().ok()?;
+        if let Some(bytes) = map.get(token).and_then(|st| st.hls_key_bytes.clone()) {
+            return Some(bytes);
+        }
+    }
+    let key_uri = {
+        let map = TS_STREAM_STATES.lock().ok()?;
+        map.get(token)
+            .and_then(|st| st.hls_key.as_ref().map(|k| k.uri.clone()))?
+    };
+    let resp = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream_get(&key_uri, upstream).send())
+        .await
+        .ok()?
+        .ok()?;
+    let body = resp.bytes().await.ok()?.to_vec();
+    if body.len() != 16 {
+        return None; // AES-128 密钥必须 16 字节
+    }
+    if let Ok(mut map) = TS_STREAM_STATES.lock() {
+        if let Some(st) = map.get_mut(token) {
+            st.hls_key_bytes = Some(body.clone());
+        }
+    }
+    Some(body)
+}
+
+/// 分片解密（会话带密钥时）：解密失败标记 failed（由连接侧按坏分片跳过）。
+async fn decrypt_entry_if_needed(
+    token: &str,
+    upstream: &Upstream,
+    entry: &SegHandle,
+    iv: Option<[u8; 16]>,
+) {
+    let Some(iv) = iv else { return };
+    let Some(key) = ensure_hls_key_bytes(token, upstream).await else {
+        lock_entry(entry).failed = Some("HLS 密钥获取失败（加密分片无法解密）".to_string());
+        notify_entry(entry);
+        return;
+    };
+    let mut e = lock_entry(entry);
+    match aes128_cbc_decrypt_segment(&e.data, &key, &iv) {
+        Ok(plain) => e.data = plain,
+        Err(err) => e.failed = Some(err),
+    }
+    drop(e);
+    notify_entry(entry);
+}
+
 /// 流式拉一个分片进共享缓冲。失败恢复策略（时间窗 + 退避 + 每次重试换
 /// 全新连接，替代旧的「固定重试 1 次」）：
 /// 1) 窗口内（SEGMENT_ATTEMPT_WINDOW）按指数退避反复重试，每次重试都用
@@ -3329,7 +3477,12 @@ fn notify_entry(e: &SegHandle) {
 /// 3) 收到半截后失败：先用上游 Range 续接补齐（206 校验起点）；
 /// 4) 403/410：URL 疑似过期，重试无意义——立即失败并打标记，让连接侧
 ///    重抓清单换新地址。
-async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHandle) {
+async fn stream_segment_into(
+    seg: String,
+    upstream: Arc<Upstream>,
+    entry: SegHandle,
+    seg_iv: Option<[u8; 16]>,
+) {
     let t_start = Instant::now();
     let mut attempt = 0usize;
     loop {
@@ -3357,7 +3510,10 @@ async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHan
                 if has_data {
                     // 半截失败：先试 Range 续接补齐（也用全新连接）
                     match stream_segment_resume(&seg, &upstream, &entry, &client).await {
-                        Ok(()) => finish_segment(&entry, None),
+                        Ok(()) => {
+                            decrypt_entry_if_needed(&upstream.token, &upstream, &entry, seg_iv).await;
+                            finish_segment(&entry, None)
+                        }
                         Err(e2) => {
                             finish_segment(&entry, Some(format!("{}；半截续接失败: {}", err, e2)))
                         }
@@ -3515,6 +3671,11 @@ fn ensure_pipeline_entry(
     if let Some(existing) = st.pipeline.get(seg) {
         return (existing.clone(), true);
     }
+    // 加密源的 IV：显式 IV 或「媒体序号 + 分片下标」（HLS 隐式 IV 规范）
+    let seg_iv: Option<[u8; 16]> = st.hls_key.as_ref().map(|k| {
+        let idx = st.segments.iter().position(|u| u == seg).unwrap_or(0) as u64;
+        k.iv.unwrap_or_else(|| sequence_iv(k.media_sequence.wrapping_add(idx)))
+    });
     let handle: SegHandle = Arc::new(std::sync::Mutex::new(SegEntry::default()));
     if let Some(data) = pop_prime_segment(seg) {
         // 预热命中：直接以已完成姿态入库
@@ -3528,7 +3689,7 @@ fn ensure_pipeline_entry(
         let h = handle.clone();
         let up = upstream.clone();
         let seg_owned = seg.to_string();
-        let task = tokio::spawn(async move { stream_segment_into(seg_owned, up, h).await });
+        let task = tokio::spawn(async move { stream_segment_into(seg_owned, up, h, seg_iv).await });
         lock_entry(&handle).task = Some(task);
     }
     st.pipeline.insert(seg.to_string(), handle.clone());
@@ -3664,6 +3825,10 @@ struct TsStreamState {
     start_position: f64,
     /// 起始分片下标（start_position 换算而来），位置换算的偏移基准
     start_index: usize,
+    /// HLS AES-128 密钥信息（清单解析捕获；None=明文源）
+    hls_key: Option<HlsKeyInfo>,
+    /// 密钥内容（16 字节，首次使用时取回并缓存）
+    hls_key_bytes: Option<Vec<u8>>,
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3789,12 +3954,17 @@ async fn serve_live_ts(
                         st.segments.clone(),
                         st.durations.clone(),
                         st.endlist,
+                        st.hls_key.clone(),
                     ));
                 }
             }
         }
         let media_url = resolve_media_playlist(&target, &upstream).await?;
-        let (pending, durations, endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+        let pl = fetch_media_playlist(&media_url, &upstream).await?;
+        let pending = pl.segments;
+        let durations = pl.durations;
+        let endlist = pl.endlist;
+        let hls_key = pl.key;
         if pending.is_empty() {
             return Err("媒体清单里没有可用分片".to_string());
         }
@@ -3806,13 +3976,14 @@ async fn serve_live_ts(
                     st.segments = pending.clone();
                     st.durations = durations.clone();
                     st.endlist = endlist;
+                    st.hls_key = hls_key.clone();
                 }
             }
         }
-        Ok((media_url, pending, durations, endlist))
+        Ok((media_url, pending, durations, endlist, hls_key))
     }
     .await;
-    let (media_url, mut pending, durations, mut endlist) = match prepared {
+    let (media_url, mut pending, durations, mut endlist, hls_key) = match prepared {
         Ok(value) => value,
         Err(e) => {
             record_proxy_error(format!("TS 串流准备失败: {}", e));
@@ -4146,9 +4317,9 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             // 直播清单：隔 2 秒重取，把新分片继续喂给电视
             tokio::time::sleep(Duration::from_secs(2)).await;
             match fetch_media_playlist(&media_url, &upstream).await {
-                Ok((next, _d, e)) => {
-                    pending.extend(next);
-                    endlist = e;
+                Ok(pl) => {
+                    pending.extend(pl.segments);
+                    endlist = pl.endlist;
                 }
                 Err(_) => continue, // 单次刷新失败不打断整条流
             }
@@ -5085,8 +5256,8 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
                     #EXTINF:10,\n\
                     https://other.cdn/seg003.ts\n\
                     #EXT-X-ENDLIST\n";
-        let (segments, _durations, endlist) =
-            parse_media_playlist(text, "https://a.b/vod/index.m3u8", &[]).expect("parse ok");
+        let pl = parse_media_playlist(text, "https://a.b/vod/index.m3u8", &[]).expect("parse ok");
+        let (segments, endlist) = (&pl.segments, pl.endlist);
         assert!(endlist);
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0], "https://a.b/vod/seg001.ts"); // 目录相对
@@ -5097,17 +5268,25 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
     #[test]
     fn parse_media_playlist_live_has_no_endlist() {
         let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nlive.ts\n";
-        let (segments, _durations, endlist) =
-            parse_media_playlist(text, "http://a.b/live.m3u8", &[]).expect("parse ok");
+        let pl = parse_media_playlist(text, "http://a.b/live.m3u8", &[]).expect("parse ok");
+        let (segments, endlist) = (&pl.segments, pl.endlist);
         assert!(!endlist);
-        assert_eq!(segments, vec!["http://a.b/live.ts".to_string()]);
+        assert_eq!(segments, &vec!["http://a.b/live.ts".to_string()]);
     }
 
     #[test]
-    fn parse_media_playlist_rejects_encryption() {
-        let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nseg.ts\n";
-        let err = parse_media_playlist(text, "https://a.b/v.m3u8", &[]).unwrap_err();
-        assert!(err.contains("AES-128"), "报错应带加密方法: {}", err);
+    fn parse_media_playlist_captures_encryption() {
+        // AES-128 不再拒绝：捕获密钥信息（URI 绝对化 + 显式 IV + 媒体序号），
+        // 取流管线按它解密（此前加密源完全无法投屏——真机 maowushi 源实证）
+        let text = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n\
+                    #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000001\n\
+                    #EXTINF:10,\nseg.ts\n#EXT-X-ENDLIST\n";
+        let pl = parse_media_playlist(text, "https://a.b/v.m3u8", &[]).expect("parse ok");
+        let key = pl.key.expect("应捕获密钥信息");
+        assert_eq!(key.uri, "https://a.b/key.bin", "密钥 URI 应按清单相对解析");
+        assert_eq!(key.media_sequence, 7);
+        let iv = key.iv.expect("显式 IV 应被解析");
+        assert_eq!(iv[15], 0x01, "IV 末字节应为 0x01");
     }
 
     #[test]
@@ -5129,8 +5308,8 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
                     #EXTINF:10,\n\
                     seg002.ts\n";
         let ads = vec!["https://a.b/vod/ad001.ts".to_string()];
-        let (segments, _durations, _endlist) =
-            parse_media_playlist(text, "https://a.b/vod/index.m3u8", &ads).expect("parse ok");
+        let pl = parse_media_playlist(text, "https://a.b/vod/index.m3u8", &ads).expect("parse ok");
+        let segments = &pl.segments;
         assert_eq!(segments.len(), 2, "广告分片应被剔除");
         assert!(!segments.iter().any(|s| s.ends_with("ad001.ts")));
     }

@@ -30,6 +30,10 @@ tauri-runtime = { version = "=2.12.2" }
 tauri-plugin-dialog = "=2.8.4" # 本地视频文件选择（Android/桌面通用，Rust 侧 blocking_pick_file）
 tauri-plugin-fs = "=2.7.1"     # Android content:// 读取（本地视频 SAF URI 取 fd 流式传输）
 urlencoding = "2.1.3"
+# HLS AES-128 加密分片解密（TS 串流支持加密源；RustCrypto，纯 Rust 无系统依赖）
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+block-padding = { version = "0.3", features = ["std"] }
 scraper = "0.19.0"
 # tauri-utils will be resolved by tauri and tauri-build
 # tauri-plugin-log = { version = "2.0.0-rc.1", features = ["colored"] } # Temporarily commented out to ensure compilation
